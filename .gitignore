@@ -1,0 +1,5 @@
+**/docker-data/**
+.env
+.venv
+reports/**
+**/__pycache__/**

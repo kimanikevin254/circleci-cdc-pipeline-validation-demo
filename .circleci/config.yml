@@ -1,0 +1,96 @@
+version: 2.1
+
+jobs:
+  validate-cdc-pipeline:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: large
+    steps:
+      - checkout
+
+      - run:
+          name: Install Python dependencies
+          command: |
+            python3 -m pip install --upgrade pip
+            pip install -r requirements.txt
+      
+      - run:
+          name: Start containers
+          command: docker compose -f pipeline/docker-compose.yml up -d
+
+      - run:
+          name: Wait for services to be ready
+          command: sleep 30
+
+      - run:
+          name: Install, configure MinIO client, and create bucket
+          command: |
+            curl https://dl.min.io/client/mc/release/linux-amd64/mc \
+              --create-dirs \
+              -o $HOME/minio-binaries/mc
+
+            chmod +x $HOME/minio-binaries/mc
+            export PATH=$PATH:$HOME/minio-binaries/
+
+            mc alias set myminio http://localhost:9000 minioadmin minioadmin
+
+            mc mb myminio/cdc-bucket
+
+      - run:
+          name: Register Postgres connector
+          command: |
+            chmod +x ./pipeline/scripts/register_postgres_connector.sh
+            ./pipeline/scripts/register_postgres_connector.sh
+
+      - run:
+          name: Run Spark job
+          command: |
+            chmod +x ./pipeline/scripts/spark-submit.sh
+            ./pipeline/scripts/spark-submit.sh &
+            echo $! > /tmp/spark_pid.txt # Store the PID of the background process
+          background: true
+
+      -  run:
+          name: Wait for the initial data to be synced to the datalake
+          command: sleep 30
+
+      - run:
+          name: Run validator
+          command: |
+            python3 validator/main.py
+
+      - run:
+          name: Stop Spark job gracefully
+          command: |
+            SPARK_SUBMIT_PID=$(cat /tmp/spark_pid.txt)
+            if [ -n "$SPARK_SUBMIT_PID" ]; then
+              echo "Attempting to stop Spark job launched with PID: $SPARK_SUBMIT_PID"
+              # Kill the process group to ensure all child processes are targeted
+              kill -TERM -$SPARK_SUBMIT_PID 2>/dev/null || true
+              sleep 10 # Give it time to shut down
+              # Check if it's still running
+              if ps -p $SPARK_SUBMIT_PID > /dev/null; then
+                echo "Spark job (PID: $SPARK_SUBMIT_PID) still running after TERM, force killing."
+                kill -KILL -$SPARK_SUBMIT_PID 2>/dev/null || true
+              else
+                echo "Spark job (PID: $SPARK_SUBMIT_PID) successfully stopped."
+              fi
+            else
+              echo "Could not find Spark submit PID from /tmp/spark_pid.txt"
+            fi
+          when: always
+
+      - store_artifacts:
+          path: reports/
+          destination: validation-reports
+
+      - run:
+          name: Cleanup containers
+          command: |
+            docker compose -f pipeline/docker-compose.yml down
+          when: always
+
+workflows:
+  validate:
+    jobs:
+      - validate-cdc-pipeline
