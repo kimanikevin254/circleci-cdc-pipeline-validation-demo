@@ -90,3 +90,63 @@ class DataAccessManager:
         if self.pg_conn:
             self.pg_conn.close()
             self.logging.info('PostgreSQL connection closed.')
+
+    def execute_changes(self, table_name: str, changes: List[Dict[str, Any]]):
+        """
+        Make controlled changes to the PostgreSQL database.
+
+        Args:
+            table_name (str): The name of the table to modify.
+            changes (List[Dict[str, Any]]): A list of dictionaries representing the changes to apply.
+                [
+                    {"operation": "insert", "data": {...}},
+                    {"operation": "update", "data": {...}, "where_column": "id", "where_value": 1},
+                    {"operation": "delete", "where_column": "id", "where_value": 2}
+                ]
+        """
+
+        with self.pg_conn.cursor() as cursor:
+            for change in changes:
+                sql = None
+                params = []
+                try:
+                    operation = change['operation']
+
+                    if operation == 'insert':
+                        columns = list(change['data'].keys())
+                        values_placeholders = ', '.join(['%s'] * len(columns))
+                        sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({values_placeholders})"
+                        params = list(change['data'].values())
+
+                    elif operation == 'update':
+                        set_clauses = []
+                        for k, v in change['data'].items():
+                            set_clauses.append(f"{k} = %s")
+                            params.append(v)
+                        set_clause_str = ', '.join(set_clauses)
+
+                        where_column = change['where_column']
+                        where_value = change['where_value']
+                        sql = f"UPDATE {table_name} SET {set_clause_str} WHERE {where_column} = %s"
+                        params.append(where_value)
+
+                    elif operation == 'delete':
+                        where_column = change['where_column']
+                        where_value = change['where_value']
+                        sql = f"DELETE FROM {table_name} WHERE {where_column} = %s"
+                        params.append(where_value)
+                    else:
+                        self.logging.warning(f"Unsupported operation: {operation}. Skipping change.")
+                        continue
+
+                    if sql:
+                        cursor.execute(sql, params)
+                        self.logging.info(f"Executed SQL (template): {sql} with parameters: {params}")
+
+                except Exception as e:
+                    self.logging.error(f"Error executing change for operation '{operation}': {e}")
+                    self.pg_conn.rollback()
+                    raise
+
+            self.pg_conn.commit()
+            return
